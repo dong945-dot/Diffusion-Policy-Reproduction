@@ -1,162 +1,226 @@
-<?xml version="1.0" encoding="utf-8"?>
+"""
+openarm_pusht_env.py
 
-<mujoco model="pusht">
+OpenArm v2.0 单臂（右臂）Push-T 环境。
+动作: 末端 (x, y) 平面目标 (m)。内部用阻尼最小二乘 IK 转右臂 7 关节角。
+观测: T 形块位姿/速度 + 右末端 site 位置 + 目标位姿。
+成功: T 形块与目标 (x,y) 误差 < pos_tol 且 yaw 误差 < yaw_tol。
+"""
 
-    <!-- 仿真参数 -->
-    <option
-        timestep="0.002"
-        gravity="0 0 -9.81"
-        integrator="Euler"/>
+import os
+import numpy as np
+import mujoco
 
-    <!-- 全局默认参数 -->
-    <default>
-        <geom
-            contype="1"
-            conaffinity="1"
-            friction="1.0 0.1 0.1"
-            solref="0.01 1"
-            solimp="0.9 0.95 0.001"/>
 
-        <joint
-            damping="0.1"
-            armature="0.001"/>
-    </default>
+# ----------------------------------------------------------------------
+# IK：右臂 7 关节，末端 site 到达 (x, y, z_fixed)
+# ----------------------------------------------------------------------
+class RightArmIK:
+    def __init__(self, model, data, site_name="right_ee_control_point",
+                 joint_names=None, z_fixed=0.06,
+                 max_iter=50, tol=1e-4, damping=1e-3):
+        self.model = model
+        self.data = data
+        self.site_id = model.site(site_name).id
+        self.z_fixed = z_fixed
+        self.max_iter = max_iter
+        self.tol = tol
+        self.damping = damping
 
-    <!-- 材质 -->
-    <asset>
-        <material
-            name="table_material"
-            rgba="0.75 0.75 0.75 1"/>
+        if joint_names is None:
+            joint_names = [f"openarm_right_joint{i}" for i in range(1, 8)]
+        self.jnt_ids = [model.joint(n).id for n in joint_names]
+        self.qadr = np.array([model.jnt_qposadr[j] for j in self.jnt_ids])
+        self.dadr = np.array([model.jnt_dofadr[j] for j in self.jnt_ids])
+        self.jnt_range = np.array([model.jnt_range[j] for j in self.jnt_ids])
 
-        <material
-            name="block_material"
-            rgba="0.20 0.25 0.35 1"/>
+        self._jacp = np.zeros((3, model.nv))
 
-        <material
-            name="pusher_material"
-            rgba="0.05 0.25 0.90 1"/>
+    def solve(self, xy_target, q_init=None):
+        """返回 7 个关节角。q_init 为 warm-start（可选）。"""
+        if q_init is not None:
+            self.data.qpos[self.qadr] = q_init
 
-        <material
-            name="target_material"
-            rgba="0.10 0.80 0.20 0.45"/>
-    </asset>
+        target = np.array([xy_target[0], xy_target[1], self.z_fixed])
+        for _ in range(self.max_iter):
+            mujoco.mj_forward(self.model, self.data)
+            cur = self.data.site_xpos[self.site_id]
+            err = target - cur
+            if np.linalg.norm(err) < self.tol:
+                break
 
-    <worldbody>
+            self._jacp[:] = 0.0
+            mujoco.mj_jacSite(self.model, self.data, self._jacp, None, self.site_id)
+            J = self._jacp[:, self.dadr]                     # 3 x 7
+            dq = J.T @ np.linalg.solve(
+                J @ J.T + self.damping * np.eye(3), err)     # 7
+            self.data.qpos[self.qadr] += dq
+            np.clip(self.data.qpos[self.qadr],
+                    self.jnt_range[:, 0], self.jnt_range[:, 1],
+                    out=self.data.qpos[self.qadr])
+        return self.data.qpos[self.qadr].copy()
 
-        <!-- 顶部光源 -->
-        <light
-            name="top_light"
-            pos="0 0 1.5"
-            dir="0 0 -1"
-            diffuse="1 1 1"/>
 
-        <!-- 桌面 -->
-        <geom
-            name="table"
-            type="box"
-            pos="0 0 -0.025"
-            size="0.5 0.5 0.025"
-            material="table_material"/>
+# ----------------------------------------------------------------------
+# 环境
+# ----------------------------------------------------------------------
+class OpenArmPushTEnv:
+    def __init__(self, xml_path, frame_skip=10, z_fixed=0.06,
+                 pos_tol=0.03, yaw_tol=0.15,
+                 action_low=(0.10, -0.30), action_high=(0.50, 0.05)):
+        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self.data = mujoco.MjData(self.model)
+        self.frame_skip = frame_skip
+        self.pos_tol = pos_tol
+        self.yaw_tol = yaw_tol
+        self.action_low = np.array(action_low, dtype=np.float64)
+        self.action_high = np.array(action_high, dtype=np.float64)
 
-        <!-- 四周墙壁 -->
-        <geom
-            name="wall_left"
-            type="box"
-            pos="-0.48 0 0.04"
-            size="0.02 0.50 0.04"/>
+        # ---- 缓存 id / 地址 ----
+        m = self.model
+        self.block_body = m.body("block").id
+        self.target_body = m.body("target").id
+        self.block_jnt = m.joint("block_free").id
+        self.block_qadr = m.jnt_qposadr[self.block_jnt]
+        self.block_dadr = m.jnt_dofadr[self.block_jnt]
 
-        <geom
-            name="wall_right"
-            type="box"
-            pos="0.48 0 0.04"
-            size="0.02 0.50 0.04"/>
+        self.right_ctrl_ids = np.array(
+            [m.actuator(f"right_joint{i}_ctrl").id for i in range(1, 8)])
+        self.right_finger_ctrl = m.actuator("right_finger1_ctrl").id
+        self.left_ctrl_ids = np.array(
+            [m.actuator(f"left_joint{i}_ctrl").id for i in range(1, 8)])
+        self.left_finger_ctrl = m.actuator("left_finger1_ctrl").id
 
-        <geom
-            name="wall_bottom"
-            type="box"
-            pos="0 -0.48 0.04"
-            size="0.50 0.02 0.04"/>
+        self.right_qadr = np.array(
+            [m.jnt_qposadr[m.joint(f"openarm_right_joint{i}").id]
+             for i in range(1, 8)])
+        self.left_qadr = np.array(
+            [m.jnt_qposadr[m.joint(f"openarm_left_joint{i}").id]
+             for i in range(1, 8)])
 
-        <geom
-            name="wall_top"
-            type="box"
-            pos="0 0.48 0.04"
-            size="0.50 0.02 0.04"/>
+        # ---- IK ----
+        self.ik = RightArmIK(m, self.data, z_fixed=z_fixed)
 
-        <!-- 蓝色推动器 -->
-        <!-- mocap body 不需要 joint，可以直接通过 Python 控制位置 -->
-        <body
-            name="pusher"
-            mocap="true"
-            pos="0 0.30 0.055">
+        # ---- 初始姿态（用 IK 反解得到，避免手填关节角） ----
+        self.block_init_qpos = np.array([0.30, -0.12, 0.06, 1, 0, 0, 0])
+        self.left_home = np.array([0.0, 0.3, 0.0, 1.2, 0.0, 0.3, 0.0])
+        self.finger_home = 0.0          # 右手指闭合到 0；左手指保持 0
+        # 先用一个合理初值做 IK warm-start
+        warm = np.array([0.0, 0.5, 0.0, 1.5, 0.0, 0.5, 0.0])
+        self.right_home = self.ik.solve((0.30, -0.12), q_init=warm)
+        print("[OpenArmPushTEnv] right_home =", np.round(self.right_home, 4))
 
-            <geom
-                name="pusher_geom"
-                type="cylinder"
-                size="0.035 0.025"
-                material="pusher_material"/>
-        </body>
+        self._obs_dim = 3 + 4 + 6 + 3 + 3 + 4   # block pos/quat/vel + ee + target pos/quat
+        self._last_q = self.right_home.copy()   # IK warm-start 缓存
 
-        <!-- 动态 T 形物体 -->
-        <body
-            name="block"
-            pos="0 0 0.06">
+    # ------------------------------------------------------------------
+    def reset(self):
+        mujoco.mj_resetData(self.model, self.data)
+        d = self.data
 
-            <!-- freejoint 允许物体在平面内平移和旋转 -->
-            <freejoint name="block_free"/>
+        # 右臂 / 左臂 / 手指
+        d.qpos[self.right_qadr] = self.right_home
+        d.qpos[self.left_qadr] = self.left_home
+        d.qpos[self.block_qadr:self.block_qadr + 7] = self.block_init_qpos
 
-            <!-- T 的横梁 -->
-            <geom
-                name="t_bar"
-                type="box"
-                pos="0 0.08 0"
-                size="0.16 0.04 0.035"
-                mass="0.20"
-                material="block_material"/>
+        d.ctrl[:] = 0.0
+        d.ctrl[self.right_ctrl_ids] = self.right_home
+        d.ctrl[self.left_ctrl_ids] = self.left_home
+        d.ctrl[self.right_finger_ctrl] = self.finger_home
+        d.ctrl[self.left_finger_ctrl] = self.finger_home
 
-            <!-- T 的竖梁 -->
-            <geom
-                name="t_stem"
-                type="box"
-                pos="0 -0.04 0"
-                size="0.04 0.12 0.035"
-                mass="0.20"
-                material="block_material"/>
-        </body>
+        self._last_q = self.right_home.copy()
+        mujoco.mj_forward(self.model, self.data)
+        return self._get_obs()
 
-        <!-- 绿色目标区域 -->
-        <!-- contype=0 和 conaffinity=0 表示不参与碰撞 -->
-        <body
-            name="target"
-            pos="0.20 0.15 0.005"
-            euler="0 0 0.7854">
+    # ------------------------------------------------------------------
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64).reshape(2)
+        action = np.clip(action, self.action_low, self.action_high)
 
-            <geom
-                name="target_bar"
-                type="box"
-                pos="0 0.08 0"
-                size="0.16 0.04 0.002"
-                material="target_material"
-                contype="0"
-                conaffinity="0"/>
+        # 1) IK: (x,y) -> 7 关节角（用上一步解 warm-start）
+        q_target = self.ik.solve(action, q_init=self._last_q)
+        self._last_q = q_target
 
-            <geom
-                name="target_stem"
-                type="box"
-                pos="0 -0.04 0"
-                size="0.04 0.12 0.002"
-                material="target_material"
-                contype="0"
-                conaffinity="0"/>
-        </body>
+        # 2) 写控制
+        d = self.data
+        d.ctrl[self.right_ctrl_ids] = q_target
+        d.ctrl[self.left_ctrl_ids] = self.left_home
+        d.ctrl[self.right_finger_ctrl] = self.finger_home
+        d.ctrl[self.left_finger_ctrl] = self.finger_home
 
-        <!-- 顶视角相机 -->
-        <camera
-            name="top"
-            pos="0 0 1.2"
-            xyaxes="1 0 0 0 1 0"
-            mode="fixed"/>
+        # 3) 推进仿真
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
 
-    </worldbody>
+        obs = self._get_obs()
+        reward = self._get_reward()
+        success = self._is_success()
+        info = {"success": success,
+                "pos_err": self._pos_err(),
+                "yaw_err": self._yaw_err()}
+        return obs, reward, success, info
 
-</mujoco>
+    # ------------------------------------------------------------------
+    def _get_obs(self):
+        d = self.data
+        block_pos = d.xpos[self.block_body].copy()
+        block_quat = d.xquat[self.block_body].copy()
+        block_vel = d.qvel[self.block_dadr:self.block_dadr + 6].copy()
+        ee_pos = d.site_xpos[self.ik.site_id].copy()
+        target_pos = d.xpos[self.target_body].copy()
+        target_quat = d.xquat[self.target_body].copy()
+        return np.concatenate(
+            [block_pos, block_quat, block_vel,
+             ee_pos, target_pos, target_quat]).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _yaw_from_quat(q):
+        w, x, y, z = q
+        return np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+    def _pos_err(self):
+        return float(np.linalg.norm(
+            self.data.xpos[self.block_body][:2] -
+            self.data.xpos[self.target_body][:2]))
+
+    def _yaw_err(self):
+        by = self._yaw_from_quat(self.data.xquat[self.block_body])
+        ty = self._yaw_from_quat(self.data.xquat[self.target_body])
+        return float(abs((by - ty + np.pi) % (2 * np.pi) - np.pi))
+
+    def _is_success(self):
+        return self._pos_err() < self.pos_tol and self._yaw_err() < self.yaw_tol
+
+    def _get_reward(self):
+        # 简单负误差奖励；可换成稀疏 + 密集组合
+        return -(self._pos_err() + 0.5 * self._yaw_err())
+
+    # ------------------------------------------------------------------
+    @property
+    def obs_dim(self):
+        return self._obs_dim
+
+    @property
+    def action_dim(self):
+        return 2
+
+
+# ----------------------------------------------------------------------
+# 自测
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    xml = os.path.join(os.path.dirname(__file__), "openarm_pusht.xml")
+    env = OpenArmPushTEnv(xml)
+    obs = env.reset()
+    print("obs shape:", obs.shape)
+    for t in range(50):
+        # 简单示例：把末端从初始点缓慢移向目标区
+        alpha = t / 50.0
+        xy = (1 - alpha) * np.array([0.30, -0.12]) + alpha * np.array([0.38, -0.20])
+        obs, r, done, info = env.step(xy)
+        if done:
+            print(f"success at step {t}, info={info}")
+            break
+    print("final info:", info)
