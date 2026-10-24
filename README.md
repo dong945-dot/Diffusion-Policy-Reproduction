@@ -1,5 +1,5 @@
 # Diffusion-Policy 复现练习
-## OpenArm 单臂 Push-T 任务环境
+## 一、任务环境
 
 ### 1. 仿真平台与版本
 
@@ -62,3 +62,4 @@
 | 对 DP 的影响 | DP 的预测动作序列（Action Horizon）需按 20 Hz 的频率进行截断与执行 |
 | DP 建议 `action_horizon` | **4 ~ 8**（对应未来 0.2 s ~ 0.4 s 的动作） |
 | DP 建议 `obs_horizon` | **2**（观测两帧以计算速度/趋势） |
+
