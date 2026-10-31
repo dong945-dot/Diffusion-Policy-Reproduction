@@ -1,0 +1,49 @@
+<mujoco model="openarm2_task">
+	<compiler angle="degree" autolimits="true"/>
+	<option gravity="0 0 -9.81" integrator="RK4"/>
+
+	<!-- Replace with the installed OpenArm 2.0 MJCF path if necessary. -->
+	<include file="openarm2.0.xml"/>
+
+	<custom>
+		<!-- metres; randomize object and target independently at reset -->
+		<numeric name="reachable_x" data="0.18 0.40"/>
+		<numeric name="reachable_y" data="-0.20 0.20"/>
+		<numeric name="object_z_mm" data="330"/>
+		<text name="grippers" data="open at reset"/>
+	</custom>
+
+	<default>
+		<geom friction="0.8 0.1 0.1" condim="3"/>
+		<site rgba="0 1 0 0.35"/>
+	</default>
+
+	<worldbody>
+		<!-- Ground and a 500 x 600 mm table, top at z=427 mm. -->
+		<geom name="ground" type="plane" size="2 2 0.01" pos="0 0 0" rgba="0.15 0.15 0.15 1"/>
+		<body name="table_center" pos="0.25 0 0.412">
+			<geom name="table" type="box" size="0.25 0.30 0.015" rgba="0.55 0.42 0.25 1"/>
+		</body>
+
+		<!-- Green reachable area: visual only, x=180..400 mm, y=-200..200 mm. -->
+		<site name="reachable_area" type="box" pos="0.29 0 0.4275" size="0.11 0.20 0.0002" rgba="0 1 0 0.30" contype="0" conaffinity="0"/>
+
+		<!-- T piece: overall 80 x 50 x 5 mm; the narrow section is 18 mm wide. -->
+		<!-- Its x/y pose is randomized on reset within the green area; initial z is 330 mm. -->
+		<body name="T_object" pos="0.29 0 0.427" euler="0 0 0">
+			<freejoint name="T_free"/>
+			<geom name="T_crossbar" type="box" pos="0.031 0 0.0025" size="0.009 0.025 0.0025" rgba="0.12 0.12 0.12 1"/>
+			<geom name="T_stem" type="box" pos="-0.009 0 0.0025" size="0.031 0.009 0.0025" rgba="0.12 0.12 0.12 1"/>
+		</body>
+
+		<!-- Red target, visual only and exactly the same T outline. -->
+		<body name="T_target" mocap="true" pos="0.34 0.12 0.427">
+			<site name="target_crossbar" type="box" pos="0.031 0 0.0026" size="0.009 0.025 0.0002" rgba="1 0 0 0.55" contype="0" conaffinity="0"/>
+			<site name="target_stem" type="box" pos="-0.009 0 0.0026" size="0.031 0.009 0.0002" rgba="1 0 0 0.55" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- Camera at the table centre, looking down at the work surface. -->
+		<camera name="table_center_camera" mode="targetbody" target="table_center" pos="0.25 0 1.00"/>
+		<light name="overhead" pos="0.25 0 1.20" dir="0 0 -1" directional="false" diffuse="1 1 1" specular="0.25 0.25 0.25" castshadow="true"/>
+	</worldbody>
+</mujoco>
