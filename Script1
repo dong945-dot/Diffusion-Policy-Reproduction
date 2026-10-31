@@ -1,0 +1,179 @@
+"""OpenArm T-block hand-off task in MuJoCo.
+
+Run from the directory containing ``env_for_task.xml``.  The script deliberately
+uses body/site names by keywords, so it also works with the usual task-scene
+variants whose exact T-block names differ.
+"""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Optional
+
+import mujoco
+import mujoco.viewer
+import numpy as np
+
+
+# Task coordinates are centimetres in the desktop frame; MuJoCo uses metres.
+T_CENTER = np.array([0.055, -0.160, 0.0])
+GOAL_CENTER = np.array([0.165, 0.160, 0.0])
+T_ANGLE_DEG = 0.0                         # clockwise from +x, as specified
+DT = 0.002
+
+
+def find_id(model: mujoco.MjModel, kind: int, words: tuple[str, ...]) -> int:
+	for i in range(model.nbody if kind == mujoco.mjtObj.mJOBJ_BODY else model.nsite):
+		name = (model.body(i).name if kind == mujoco.mjtObj.mJOBJ_BODY
+				else model.site(i).name).lower()
+		if all(w in name for w in words):
+			return i
+	return -1
+
+
+def find_body(model, *groups: tuple[str, ...]) -> int:
+	for group in groups:
+		i = find_id(model, mujoco.mjtObj.mJOBJ_BODY, group)
+		if i >= 0:
+			return i
+	return -1
+
+
+def free_body_pose(model, data, body_id: int, xyz: np.ndarray, angle_deg=0.0):
+	"""Set a free T/target body pose, if the XML exposes a free joint."""
+	if body_id < 0:
+		return False
+	j = model.body_jntadr[body_id]
+	if j >= 0 and model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+		q = model.jnt_qposadr[j]
+		data.qpos[q:q + 3] = xyz
+		a = math.radians(angle_deg)
+		data.qpos[q + 3:q + 7] = [math.cos(a / 2), 0, 0, math.sin(a / 2)]
+		return True
+	# A fixed body can still be positioned in a scene generated for this task.
+	model.body_pos[body_id] = xyz
+	return False
+
+
+def jacobian_ik(model, data, site_id: int, qadr: np.ndarray, goal: np.ndarray,
+				q0: np.ndarray, steps=12):
+	"""Small damped least-squares position IK, respecting joint limits."""
+	for _ in range(steps):
+		mujoco.mj_forward(model, data)
+		err = goal - data.site_xpos[site_id]
+		if np.linalg.norm(err) < 0.002:
+			break
+		jac = np.zeros((3, model.nv))
+		mujoco.mj_jacSite(model, data, jac, None, site_id)
+		j = jac[:, qadr]
+		dq = j.T @ np.linalg.solve(j @ j.T + 2e-3 * np.eye(3), err)
+		q0 += np.clip(dq, -0.08, 0.08)
+		for k, a in enumerate(qadr):
+			jnt = model.dof_jntid[a]
+			if model.jnt_limited[jnt]:
+				q0[k] = np.clip(q0[k], model.jnt_range[jnt, 0], model.jnt_range[jnt, 1])
+		data.qpos[qadr] = q0
+	return q0.copy()
+
+
+def arm_setup(model, prefix: str):
+	names = [f"openarm_{prefix}_joint{i}" for i in range(1, 8)]
+	ids = np.array([mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in names])
+	if np.any(ids < 0):
+		raise RuntimeError(f"missing {prefix} arm joints")
+	qadr = model.jnt_dofadr[ids]
+	site_name = f"{prefix}_ee_control_point"
+	sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+	if sid < 0:
+		sid = find_id(model, mujoco.mjtObj.mJOBJ_SITE, (prefix, "ee"))
+	return ids, qadr, sid
+
+
+def move_arm(model, data, arm, point, duration=1.0, grip=None):
+	_, qadr, sid = arm
+	q = data.qpos[qadr].copy()
+	q_goal = jacobian_ik(model, data, sid, qadr, point, q, 30)
+	n = max(1, int(duration / model.opt.timestep))
+	start = data.qpos[qadr].copy()
+	for k in range(n):
+		s = (k + 1) / n
+		data.ctrl[arm[0]] = start * (1 - s) + q_goal * s
+		if grip is not None:
+			grip()
+		mujoco.mj_step(model, data)
+
+
+def main():
+	xml = Path("env_for_task.xml")
+	if not xml.exists():
+		raise FileNotFoundError("请把本程序放在 env_for_task.xml 所在目录运行")
+	model = mujoco.MjModel.from_xml_path(str(xml))
+	model.opt.timestep = DT
+	data = mujoco.MjData(model)
+
+	left = arm_setup(model, "left")
+	right = arm_setup(model, "right")
+	# Names used by common env_for_task.xml variants.
+	t_body = find_body(model, ("t",), ("block",), ("piece",))
+	target_body = find_body(model, ("target",), ("goal",))
+	free_body_pose(model, data, t_body, T_CENTER + np.array([0, 0, 0.025]), T_ANGLE_DEG)
+	free_body_pose(model, data, target_body, GOAL_CENTER + np.array([0, 0, 0.002]), 0)
+	mujoco.mj_forward(model, data)
+
+	# Camera information is used for the wrist-side approach and retained for
+	# visual servoing/debugging (camera coordinates are not assumed to be axes).
+	camera_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, n)
+				  for n in ("camera_wrist_left", "camera_wrist_right")]
+	camera_ids = [i for i in camera_ids if i >= 0]
+	for i in camera_ids:
+		print("camera", model.camera(i).name, "pos=", data.cam_xpos[i], "mat=", data.cam_xmat[i].reshape(3, 3))
+
+	def set_grip(value):
+		# finger1 actuator is the only independently actuated finger; equality
+		# in the supplied XML mirrors finger2.
+		data.ctrl[left[0][-1] if False else mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR,
+															  "left_finger1_ctrl")] = value
+
+	def grip(side, value):
+		aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{side}_finger1_ctrl")
+		if aid >= 0:
+			data.ctrl[aid] = value
+
+	# Initialisation: both arms rise laterally, then converge and extend.
+	z = 0.24
+	move_arm(model, data, right, np.array([0.20, -0.22, z]), 1.4)
+	move_arm(model, data, left, np.array([0.20, 0.22, z]), 1.4)
+	move_arm(model, data, right, np.array([0.13, -0.08, 0.20]), 1.0)
+	move_arm(model, data, left, np.array([0.13, 0.08, 0.20]), 1.0)
+
+	# Right hand takes the vertical bar from its side; fingers open/close.
+	grip("right", 0.0)
+	move_arm(model, data, right, T_CENTER + [0.0, -0.055, 0.055], 1.2)
+	grip("right", 0.48)
+	for _ in range(250):
+		mujoco.mj_step(model, data)
+
+	# Left hand approaches the horizontal bar from above/below, then takes it.
+	grip("left", 0.0)
+	move_arm(model, data, left, T_CENTER + [0.0, 0.0, 0.085], 1.2)
+	grip("left", 0.55)
+	grip("right", 0.0)
+	for _ in range(250):
+		mujoco.mj_step(model, data)
+
+	# Move while preserving the requested zero orientation; the final small
+	# descent places the T centre on the target centre.
+	move_arm(model, data, left, GOAL_CENTER + [0.0, 0.0, 0.085], 1.8)
+	move_arm(model, data, left, GOAL_CENTER + [0.0, 0.0, 0.035], 0.8)
+	grip("left", 0.0)
+
+	with mujoco.viewer.launch_passive(model, data) as viewer:
+		viewer.cam.distance = 0.65
+		viewer.cam.lookat[:] = [0.11, 0.0, 0.05]
+		while viewer.is_running():
+			mujoco.mj_step(model, data)
+			viewer.sync()
+
+
+if __name__ == "__main__":
+	main()
