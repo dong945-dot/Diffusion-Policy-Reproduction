@@ -29,36 +29,28 @@
     <light pos="0.3 0 1.6" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <!-- ==================== 工作台 ==================== -->
-    <!-- 桌面中心 x=0.42, 表面高度恰好位于 z = 0.18 (0.09 + 0.09) -->
-    <body name="table" pos="0.42 0 0.09">
-      <geom name="table_top" type="box" size="0.25 0.38 0.09" material="table_mat" friction="0.8 0.005 0.0001"/>
+   <!-- ==================== 工作台 (位置最舒适的 X=0.32) ==================== -->
+    <body name="table" pos="0.32 0 0.09">
+      <geom name="table_top" type="box" size="0.20 0.32 0.09" material="table_mat" friction="1.2 0.01 0.005"/>
     </body>
 
-    <!-- ==================== 目标区域 (Goal Zone - 静态虚影) ==================== -->
-    <!-- contype="0" conaffinity="0" 确保不产生任何物理碰撞阻碍 -->
-    <body name="goal_zone" pos="0.42 0 0.181">
-      <!-- 横梁 -->
+    <!-- ==================== 目标虚影 (彻底禁绝任何碰撞) ==================== -->
+    <body name="goal_zone" pos="0.33 0 0.181">
       <geom name="goal_head" type="box" size="0.08 0.025 0.001" pos="0 0.04 0" 
-            material="goal_mat" contype="0" conaffinity="0"/>
-      <!-- 竖梁 -->
+            material="goal_mat" contype="0" conaffinity="0" group="1"/>
       <geom name="goal_stem" type="box" size="0.025 0.04 0.001" pos="0 -0.025 0" 
-            material="goal_mat" contype="0" conaffinity="0"/>
+            material="goal_mat" contype="0" conaffinity="0" group="1"/>
     </body>
 
-    <!-- ==================== 可被推动的 3D T 型块 ==================== -->
-    <!-- 初始高度设定在桌面顶部稍微偏上 0.015m，受重力平稳落于桌面上 -->
-    <body name="tee_block" pos="0.38 -0.05 0.195">
-      <freejoint name="tee_freejoint"/>
-      <!-- T块由两部分组合而成，整体高 0.03m (半高 0.015m) -->
-      <!-- 横梁 (Head) -->
+    <!-- ==================== 逼真物理特性的 3D T 块 ==================== -->
+    <body name="tee_block" pos="0.28 0 0.20">
+      <!-- 增加 damping 消除冰壶效应，不推绝不无故自滑 -->
+      <joint name="tee_freejoint" type="free" damping="0.05" armature="0.01"/>
       <geom name="tee_head" type="box" size="0.08 0.025 0.015" pos="0 0.04 0" 
-            material="tee_mat" mass="0.08" friction="0.6 0.01 0.005" solref="0.01 1" solimp="0.9 0.95 0.001"/>
-      <!-- 竖梁 (Stem) -->
+            material="tee_mat" mass="0.15" friction="1.2 0.02 0.01"/>
       <geom name="tee_stem" type="box" size="0.025 0.04 0.015" pos="0 -0.025 0" 
-            material="tee_mat" mass="0.06" friction="0.6 0.01 0.005" solref="0.01 1" solimp="0.9 0.95 0.001"/>
+            material="tee_mat" mass="0.10" friction="1.2 0.02 0.01"/>
     </body>
-
     <!-- ==================== 摄像头配置 (Diffusion Policy 视觉输入) ==================== -->
     <!-- 1. 正上方俯视相机 (Push-T 经典输入视角) -->
     <camera name="top_cam" pos="0.42 0 0.85" euler="0 0 1.5708" fovy="55"/>
