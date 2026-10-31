@@ -242,7 +242,7 @@ class DataCollector:
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    xml_path = os.path.join(current_dir, "openarm_push_t.xml")
+    xml_path = os.path.join(current_dir, "openarm_pusht.xml")
     
     collector = DataCollector(xml_path=xml_path)
     collector.collect_dataset(num_episodes=10, max_steps=180)
