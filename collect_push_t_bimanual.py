@@ -28,10 +28,8 @@ class SmoothBimanualIKSolver:
             self.left_ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, left_ee_name)
             self.use_site = True
 
-        # 默认中立舒适姿态（名义姿态：双臂自然微曲悬停，杜绝肘部奇形怪状）
         self.q_nominal = np.zeros(self.model.nu)
         if self.model.nu >= 14:
-            # 预设一个典型的人形双臂自然下垂姿态
             self.q_nominal[:7] = [0.0, 0.4, 0.0, -1.2, 0.0, 0.5, 0.0]
             self.q_nominal[7:14] = [0.0, -0.4, 0.0, -1.2, 0.0, 0.5, 0.0]
 
@@ -40,7 +38,6 @@ class SmoothBimanualIKSolver:
             curr_l = self.data.site_xpos[self.left_ee_id] if self.use_site else self.data.xpos[self.left_ee_id]
             curr_r = self.data.site_xpos[self.right_ee_id] if self.use_site else self.data.xpos[self.right_ee_id]
 
-            # 计算末端误差并限幅
             err_l = left_target_pos - curr_l
             err_r = right_target_pos - curr_r
             error = np.clip(np.concatenate([err_l, err_r]), -0.05, 0.05)
@@ -58,22 +55,20 @@ class SmoothBimanualIKSolver:
                 mujoco.mj_jacBody(self.model, self.data, jacp_r, jacr, self.right_ee_id)
 
             J = np.vstack([jacp_l, jacp_r])  # (6, nv)
-            
-            # 阻尼最小二乘伪逆: J_pinv = J^T (J J^T + lambda^2 I)^-1
             reg = damping * np.eye(6)
             J_pinv = J.T @ np.linalg.inv(J @ J.T + reg)
 
-            # 主任务增量
             dq_main = J_pinv @ error
 
-            # 零空间自构形控制 (Null-space projection): 把手臂往好看自然的中立姿态拉
+            # 修正维度：dq_null 拓展为与 nv 相同的 24 维
             I = np.eye(self.model.nv)
+            dq_null = np.zeros(self.model.nv)
             q_current = self.data.qpos[:self.model.nu]
-            dq_null = 0.5 * (self.q_nominal - q_current)
-            
-            # 合并主任务与零空间任务
+            dq_null[:self.model.nu] = 0.5 * (self.q_nominal - q_current)
+
             dq = dq_main + (I - J_pinv @ J) @ dq_null
-            dq = np.clip(dq, -0.05, 0.05)  # 严格限制单步关节跳变
+            dq[self.model.nu:] = 0.0  # 确保 T 块自由度不受非物理扰动
+            dq = np.clip(dq, -0.05, 0.05)
 
             mujoco.mj_integratePos(self.model, self.data.qpos, dq, 1.0)
             mujoco.mj_kinematics(self.model, self.data)
