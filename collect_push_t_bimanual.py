@@ -13,7 +13,7 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. 刚性手腕锁定的双臂闭环 IK 执行器 (确保夹爪垂直朝下，绝不翻滚侧倾)
+# 1. 刚性手腕锁定的双臂闭环 IK 执行器 (夹爪垂直朝下，抑制手腕乱转)
 # ==============================================================================
 class BimanualRigidWristIK:
     def __init__(self, model, data, left_ee_name, right_ee_name):
@@ -27,10 +27,9 @@ class BimanualRigidWristIK:
             self.left_ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, left_ee_name)
             self.use_site = True
 
-        # 预设标准垂直端正工作姿态
+        # 标准垂直下指姿态
         self.q_nominal = np.zeros(self.model.nu)
         if self.model.nu >= 14:
-            # 严格锁定肘关节外倾与手腕垂直下指姿态
             self.q_nominal[:7] = [0.0, 0.45, 0.0, -1.25, 0.0, 0.8, 0.0]
             self.q_nominal[7:14] = [0.0, -0.45, 0.0, -1.25, 0.0, 0.8, 0.0]
 
@@ -55,24 +54,23 @@ class BimanualRigidWristIK:
                 mujoco.mj_jacBody(self.model, self.data, jacp_l, jacr, self.left_ee_id)
                 mujoco.mj_jacBody(self.model, self.data, jacp_r, jacr, self.right_ee_id)
 
-            J = np.vstack([jacp_l, jacp_r])  # (6, 24)
+            J = np.vstack([jacp_l, jacp_r])
             reg = damping * np.eye(6)
             J_pinv = J.T @ np.linalg.inv(J @ J.T + reg)
 
             dq_main = J_pinv @ error
 
-            # 强手腕约束：对后部关节（手腕）施加极大归位权重，保证手爪严格垂直朝下
+            # 零空间约束：重点锁定手腕关节，保持垂直姿态
             I = np.eye(self.model.nv)
             dq_null = np.zeros(self.model.nv)
             weights = np.ones(self.model.nu) * 0.3
             if self.model.nu >= 14:
-                # 强化手腕关节阻尼权重
                 weights[4:7] = 0.8
                 weights[11:14] = 0.8
             dq_null[:self.model.nu] = weights * (self.q_nominal - self.data.qpos[:self.model.nu])
 
             dq = dq_main + (I - J_pinv @ J) @ dq_null
-            dq[self.model.nu:] = 0.0  # 严防扰动 T 块自身自由度
+            dq[self.model.nu:] = 0.0
             dq = np.clip(dq, -0.035, 0.035)
 
             mujoco.mj_integratePos(self.model, self.data.qpos, dq, 1.0)
@@ -96,24 +94,19 @@ class ClosedLoopPushExpert:
         self.curr_r = np.array(initial_r, dtype=np.float64)
 
     def step(self, t_curr_pos, t_curr_yaw, goal_pos, goal_yaw):
-        """每一帧都根据 T 块的【实时真实位置】动态调整落点与推力"""
         diff_yaw = (goal_yaw - t_curr_yaw + np.pi) % (2 * np.pi) - np.pi
         diff_pos = goal_pos[:2] - t_curr_pos[:2]
         dist = np.linalg.norm(diff_pos)
 
-        # -------------------------------------------------------------
         # 模式 1: 姿态偏差过大 -> 启动原地闭环拧转
-        # -------------------------------------------------------------
         if abs(diff_yaw) > np.deg2rad(10.0):
             t_dir = np.array([np.cos(t_curr_yaw), np.sin(t_curr_yaw)])
             t_perp = np.array([-np.sin(t_curr_yaw), np.cos(t_curr_yaw)])
             
-            # 紧贴 T 块横梁左右两侧
             pt_left = t_curr_pos[:2] + 0.065 * t_dir
             pt_right = t_curr_pos[:2] - 0.065 * t_dir
             
             sign = 1.0 if diff_yaw > 0 else -1.0
-            # 形成反向力偶
             tgt_l_2d = pt_left - sign * 0.035 * t_perp
             tgt_r_2d = pt_right + sign * 0.035 * t_perp
 
@@ -121,17 +114,12 @@ class ClosedLoopPushExpert:
             desired_r = np.array([tgt_r_2d[0], tgt_r_2d[1], self.push_z])
             phase = "ROTATE"
 
-        # -------------------------------------------------------------
-        # 模式 2: 姿态已对准 -> 动态咬住 T 块后方协同向前推
-        # -------------------------------------------------------------
+        # 模式 2: 姿态已对准 -> 动态咬住 T 块后方推进
         else:
             push_dir = diff_pos / (dist + 1e-6)
             push_perp = np.array([-push_dir[1], push_dir[0]])
             
-            # 严格位于【当前 T 块】后方 4.5cm 处
             contact_center = t_curr_pos[:2] - 0.045 * push_dir
-            
-            # 双手分开 7cm 形成闭环“卡槽”
             tgt_l_2d = contact_center + 0.035 * push_perp + 0.03 * push_dir
             tgt_r_2d = contact_center - 0.035 * push_perp + 0.03 * push_dir
 
@@ -139,9 +127,7 @@ class ClosedLoopPushExpert:
             desired_r = np.array([tgt_r_2d[0], tgt_r_2d[1], self.push_z])
             phase = "PUSH"
 
-        # -------------------------------------------------------------
-        # 闭环平滑阻尼器（限制单步最大位移 2.5mm，保持丝滑）
-        # -------------------------------------------------------------
+        # 闭环平滑滤波（限制单步最大位移 2.5mm）
         max_step_dist = 0.0025
         delta_l = desired_l - self.curr_l
         dist_l = np.linalg.norm(delta_l)
@@ -160,7 +146,7 @@ class ClosedLoopPushExpert:
 
 
 # ==============================================================================
-# 3. 闭环采集与成功筛选系统
+# 3. 数据采集与全量保存系统（无论成败均保存 10 条）
 # ==============================================================================
 class BimanualDataCollector:
     def __init__(self, xml_path="openarm_pusht.xml", zarr_save_path="push_t_demo.zarr"):
@@ -212,7 +198,6 @@ class BimanualDataCollector:
         self.data.qpos[:len(self.ik_solver.q_nominal)] = self.ik_solver.q_nominal
         mujoco.mj_forward(self.model, self.data)
 
-        # 初始化闭环规划器的起点
         l_init = self.data.xpos[self.ik_solver.left_ee_id].copy()
         r_init = self.data.xpos[self.ik_solver.right_ee_id].copy()
         self.expert.reset(l_init, r_init)
@@ -224,20 +209,22 @@ class BimanualDataCollector:
     def collect_dataset(self, num_episodes=10, max_steps=260):
         obs_img_list, obs_state_list, action_list = [], [], []
         t_init_list, goal_init_list, episode_ends = [], [], []
-
-        successful_episodes = 0
-        total_attempts = 0
+        
+        # 记录每条轨迹的最终状态用于统计汇报
+        ep_summary = []
         total_steps = 0
         debug_gif_frames = []
 
-        print(f"\n🚀 启动【闭环反应式】双臂推 T 示教采集（目标: {num_episodes} 条高质量轨迹）...")
+        print(f"\n=======================================================")
+        print(f"🚀 开始采集固定 {num_episodes} 条双臂推 T 轨迹 (全量保存供回放分析)")
+        print(f"=======================================================\n")
 
-        while successful_episodes < num_episodes:
-            total_attempts += 1
+        for ep_i in range(num_episodes):
             t_pos, t_yaw, g_pos, g_yaw, t_init_7d, goal_init_7d = self.reset_environment()
 
             ep_imgs, ep_states, ep_actions = [], [], []
             ep_success = False
+            last_p_err, last_y_err = 0.0, 0.0
 
             for step in range(max_steps):
                 self.renderer.update_scene(self.data, camera=self.camera_name)
@@ -247,7 +234,7 @@ class BimanualDataCollector:
                 r_pos = self.data.xpos[self.ik_solver.right_ee_id].copy()
                 agent_state = np.concatenate([l_pos, r_pos])
 
-                # 💡 核心：每一步都向专家输入【此时此刻真实 T 块的实时坐标】，杜绝盲推
+                # 闭环步进
                 target_l, target_r, phase = self.expert.step(t_pos, t_yaw, g_pos, g_yaw)
                 action = np.concatenate([target_l, target_r])
 
@@ -257,7 +244,7 @@ class BimanualDataCollector:
                 for _ in range(4):
                     mujoco.mj_step(self.model, self.data)
 
-                # 实时刷新读取 T 块最新真实位姿
+                # 更新 T 块真实位置
                 t_joint_id = self.model.joint("tee_freejoint").qposadr[0]
                 t_pos = self.data.qpos[t_joint_id:t_joint_id+3]
                 q_wxyz = self.data.qpos[t_joint_id+3:t_joint_id+7]
@@ -268,29 +255,38 @@ class BimanualDataCollector:
                 ep_states.append(agent_state)
                 ep_actions.append(action)
 
-                # 实时判定是否达成目标
+                # 检查是否提前达标
                 success, p_err, y_err = self.check_success(t_pos, t_yaw, g_pos, g_yaw)
+                last_p_err, last_y_err = p_err, y_err
+
                 if success:
                     ep_success = True
-                    print(f"✔ 尝试 #{total_attempts}: 闭环推正成功！耗时 {step+1} 步 | 距离误差: {p_err*100:.1f}cm, 角度误差: {np.rad2deg(y_err):.1f}°")
+                    print(f"▶ 轨迹 [{ep_i + 1}/{num_episodes}]: ✔ 达标完成 (提前于 {step + 1} 步收敛) | 距离: {p_err*100:.1f}cm, 角度差: {np.rad2deg(y_err):.1f}°")
                     break
 
-            if ep_success:
-                obs_img_list.extend(ep_imgs)
-                obs_state_list.extend(ep_states)
-                action_list.extend(ep_actions)
-                t_init_list.append(t_init_7d)
-                goal_init_list.append(goal_init_7d)
-                total_steps += len(ep_actions)
-                episode_ends.append(total_steps)
+            if not ep_success:
+                print(f"▶ 轨迹 [{ep_i + 1}/{num_episodes}]: ✘ 满步超时 (共 {len(ep_actions)} 步) | 最终距离: {last_p_err*100:.1f}cm, 角度差: {np.rad2deg(last_y_err):.1f}° [已保留]")
 
-                if successful_episodes == 0 and HAS_IMAGEIO:
-                    debug_gif_frames = ep_imgs.copy()
+            # 录制第 1 条轨迹为 GIF
+            if ep_i == 0 and HAS_IMAGEIO:
+                debug_gif_frames = ep_imgs.copy()
 
-                successful_episodes += 1
-                print(f"进度: [{successful_episodes}/{num_episodes}] (当前有效成功率: {successful_episodes/total_attempts*100:.1f}%)")
-            else:
-                print(f"✘ 尝试 #{total_attempts}: 超时脱靶，自动丢弃重试...")
+            # 💡 核心修改：无论达标与否，10 条数据 100% 全部存入数据集
+            obs_img_list.extend(ep_imgs)
+            obs_state_list.extend(ep_states)
+            action_list.extend(ep_actions)
+            t_init_list.append(t_init_7d)
+            goal_init_list.append(goal_init_7d)
+            total_steps += len(ep_actions)
+            episode_ends.append(total_steps)
+
+            ep_summary.append({
+                "ep": ep_i + 1,
+                "success": ep_success,
+                "steps": len(ep_actions),
+                "dist_cm": last_p_err * 100,
+                "yaw_deg": np.rad2deg(last_y_err)
+            })
 
         # 写入 Zarr 数据集
         root = zarr.open(self.zarr_path, mode='w')
@@ -306,9 +302,19 @@ class BimanualDataCollector:
         if HAS_IMAGEIO and len(debug_gif_frames) > 0:
             gif_path = "debug_episode.gif"
             imageio.mimsave(gif_path, debug_gif_frames[::2], fps=20)
-            print(f"已导出首条高质量闭环示教动图: {os.path.abspath(gif_path)}")
+            print(f"\n已自动导出第 1 条轨迹动图: {os.path.abspath(gif_path)}")
 
-        print(f"\n全部 {num_episodes} 条高质量示教轨迹采集完成！已存入: {os.path.abspath(self.zarr_path)}")
+        # 最终汇报总结
+        print("\n" + "="*55)
+        print("📊 10 次尝试数据采集与诊断汇报：")
+        print("="*55)
+        success_count = sum(1 for item in ep_summary if item['success'])
+        for item in ep_summary:
+            status = "✔ 达标" if item['success'] else "✘ 未完全对准"
+            print(f"  • Episode {item['ep']:2d}: {status} | 步数: {item['steps']:3d} | 距离误差: {item['dist_cm']:4.1f}cm | 角度误差: {item['yaw_deg']:4.1f}°")
+        print(f"\n总计: {success_count}/{num_episodes} 条达标，10 条数据已 100% 写入: {os.path.abspath(self.zarr_path)}")
+        print("="*55)
+        print("\n👉 现在你可以直接在终端运行: python replay_push_t.py 查看全过程回放！\n")
 
 
 if __name__ == "__main__":
