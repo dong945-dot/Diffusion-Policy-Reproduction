@@ -174,6 +174,6 @@ def replay_dataset(zarr_path="push_t_demo.zarr", xml_path="openarm_push_t.xml"):
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     zarr_file = os.path.join(current_dir, "push_t_demo.zarr")
-    xml_file = os.path.join(current_dir, "openarm_push_t.xml")
+    xml_file = os.path.join(current_dir, "openarm_pusht.xml")
     
     replay_dataset(zarr_path=zarr_file, xml_path=xml_file)
